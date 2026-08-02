@@ -7,6 +7,7 @@ interface Props {
   trace: TraceSession | null;
   isRecording: boolean;
   isReplaying: boolean;
+  isTrackLoading: boolean;
   replayIssue: string | null;
   trackMatches: TrackMatches | null;
   allowMismatch: boolean;
@@ -22,6 +23,7 @@ export function TransportControls({
   trace,
   isRecording,
   isReplaying,
+  isTrackLoading,
   replayIssue,
   trackMatches,
   allowMismatch,
@@ -79,7 +81,8 @@ export function TransportControls({
           type="button"
           className={`btn btn-transport ${isRecording ? "btn-rec--active" : ""}`}
           onClick={onRecord}
-          disabled={busy}
+          disabled={busy || isTrackLoading}
+          title={isTrackLoading ? "Wait for track hashing and decoding to finish" : "Record a performance trace"}
         >
           ● REC
         </button>

@@ -45,6 +45,7 @@ interface GhostState {
 }
 
 const EMPTY_TRACKS: LoadedTracks = { A: null, B: null };
+const EMPTY_LOADING_STATE: Record<DeckId, boolean> = { A: false, B: false };
 
 function traceNeedsDeck(trace: TraceSession, deck: DeckId) {
   if (trace.initialState[deck].duration > 0 || trace.initialState[deck].isPlaying) return true;
@@ -77,6 +78,7 @@ export default function App() {
   const [trace, setTrace] = useState<TraceSession | null>(null);
   const [ghost, setGhost] = useState<GhostState>({});
   const [loadedTracks, setLoadedTracks] = useState<LoadedTracks>(EMPTY_TRACKS);
+  const [loadingDecks, setLoadingDecks] = useState(EMPTY_LOADING_STATE);
   const [allowMismatch, setAllowMismatch] = useState(false);
   const [replayOutcome, setReplayOutcome] = useState<ReplayOutcome | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
@@ -117,14 +119,19 @@ export default function App() {
     [loadedTracks, trace],
   );
   const replayIssue = findReplayIssue(trace, trackMatches, allowMismatch);
+  const isTrackLoading = loadingDecks.A || loadingDecks.B;
 
   const handleTrackLoaded = useCallback((deck: DeckId, track: TrackIdentity) => {
     setLoadedTracks((current) => ({ ...current, [deck]: track }));
     setRuntimeError("");
   }, []);
 
+  const handleLoadingChange = useCallback((deck: DeckId, isLoading: boolean) => {
+    setLoadingDecks((current) => ({ ...current, [deck]: isLoading }));
+  }, []);
+
   const handleRecord = useCallback(async () => {
-    if (isRecording || isReplaying) return;
+    if (isRecording || isReplaying || isTrackLoading) return;
     try {
       await engine.resume();
       const initialState = engine.getSnapshot();
@@ -140,7 +147,7 @@ export default function App() {
     } catch (error) {
       setRuntimeError(`RECORD FAILED · ${(error as Error).message}`);
     }
-  }, [isRecording, isReplaying, loadedTracks]);
+  }, [isRecording, isReplaying, isTrackLoading, loadedTracks]);
 
   const buildOutcome = useCallback((
     timing: ReplayTimingReport,
@@ -279,6 +286,7 @@ export default function App() {
             loadDisabled={isRecording || isReplaying}
             controlsDisabled={isReplaying}
             onTrackLoaded={handleTrackLoaded}
+            onLoadingChange={handleLoadingChange}
           />
           <div className="center-column">
             <Crossfader engine={engine} bus={bus} ghostValue={ghost.crossfader} disabled={isReplaying} />
@@ -305,6 +313,7 @@ export default function App() {
             loadDisabled={isRecording || isReplaying}
             controlsDisabled={isReplaying}
             onTrackLoaded={handleTrackLoaded}
+            onLoadingChange={handleLoadingChange}
           />
         </div>
 
@@ -314,6 +323,7 @@ export default function App() {
           trace={trace}
           isRecording={isRecording}
           isReplaying={isReplaying}
+          isTrackLoading={isTrackLoading}
           replayIssue={replayIssue}
           trackMatches={trackMatches}
           allowMismatch={allowMismatch}

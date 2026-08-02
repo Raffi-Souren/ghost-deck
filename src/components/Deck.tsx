@@ -18,6 +18,7 @@ interface Props {
   loadDisabled: boolean;
   controlsDisabled: boolean;
   onTrackLoaded: (deck: DeckId, track: TrackIdentity) => void;
+  onLoadingChange: (deck: DeckId, isLoading: boolean) => void;
 }
 
 function formatTime(seconds: number) {
@@ -37,9 +38,11 @@ export function Deck({
   loadDisabled,
   controlsDisabled,
   onTrackLoaded,
+  onLoadingChange,
 }: Props) {
   const state = useDeckState(engine, id);
   const inputRef = useRef<HTMLInputElement>(null);
+  const loadingRef = useRef(false);
   const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
@@ -47,14 +50,16 @@ export function Deck({
   const [waveformPeaks, setWaveformPeaks] = useState<number[]>([]);
 
   const loadFile = useCallback(async (file: File) => {
-    if (loadDisabled) return;
+    if (loadDisabled || loadingRef.current) return;
     setError("");
     if (!file.type.startsWith("audio/") && !/\.(mp3|wav|ogg|flac|aac|m4a)$/i.test(file.name)) {
       setError("UNSUPPORTED OR UNRECOGNIZED AUDIO");
       return;
     }
 
+    loadingRef.current = true;
     setIsLoading(true);
+    onLoadingChange(id, true);
     try {
       const arrayBuffer = await file.arrayBuffer();
       const fingerprintBuffer = arrayBuffer.slice(0);
@@ -76,9 +81,11 @@ export function Deck({
       setError("DECODE FAILED IN THIS BROWSER");
       console.error(loadError);
     } finally {
+      loadingRef.current = false;
       setIsLoading(false);
+      onLoadingChange(id, false);
     }
-  }, [engine, id, loadDisabled, onTrackLoaded]);
+  }, [engine, id, loadDisabled, onLoadingChange, onTrackLoaded]);
 
   const handleFileInput = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
