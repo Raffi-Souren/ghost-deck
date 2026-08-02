@@ -1,208 +1,308 @@
-/**
- * Deck component
- * Represents one audio deck (A or B).
- */
-
 import { useRef, useState, useCallback } from "react";
-import type { AudioEngine, DeckId } from "../engine/AudioEngine";
-import type { TraceRecorder } from "../engine/TraceRecorder";
+import type { AudioEngine } from "../engine/AudioEngine";
+import type { ControlBus, DeckId } from "../engine/ControlBus";
+import { filterHzToUnit, filterUnitToHz } from "../engine/AudioMath";
+import { sha256Hex, type TrackIdentity } from "../engine/TrackIdentity";
 import { useDeckState } from "../hooks/useDeckState";
 import { Visualiser } from "./Visualiser";
+import { WaveformOverview } from "./WaveformOverview";
 
 interface Props {
   id: DeckId;
   engine: AudioEngine;
-  recorder: TraceRecorder;
-  ghostGain?: number;      // value from ghost overlay (undefined = no ghost)
+  bus: ControlBus;
+  ghostGain?: number;
   ghostFilter?: number;
+  ghostDelay?: number;
+  ghostReverb?: number;
+  loadDisabled: boolean;
+  controlsDisabled: boolean;
+  onTrackLoaded: (deck: DeckId, track: TrackIdentity) => void;
 }
 
-function fmt(sec: number) {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+function formatTime(seconds: number) {
+  const minutes = Math.floor(seconds / 60);
+  const remainder = Math.floor(seconds % 60);
+  return `${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`;
 }
 
-export function Deck({ id, engine, recorder, ghostGain, ghostFilter }: Props) {
+export function Deck({
+  id,
+  engine,
+  bus,
+  ghostGain,
+  ghostFilter,
+  ghostDelay,
+  ghostReverb,
+  loadDisabled,
+  controlsDisabled,
+  onTrackLoaded,
+}: Props) {
   const state = useDeckState(engine, id);
-  const [fileName, setFileName] = useState<string>("");
-  const [error, setError] = useState<string>("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [fileName, setFileName] = useState("");
+  const [error, setError] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
-  const objectUrlRef = useRef<string>("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [waveformPeaks, setWaveformPeaks] = useState<number[]>([]);
 
-  const loadFile = useCallback(
-    async (file: File) => {
-      setError("");
-      if (!file.type.startsWith("audio/") && !file.name.match(/\.(mp3|wav|ogg|flac|aac|m4a)$/i)) {
-        setError("UNSUPPORTED FORMAT");
-        return;
-      }
-      try {
-        // Revoke previous object URL
-        if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
-        const arrayBuffer = await file.arrayBuffer();
-        await engine.loadBuffer(id, arrayBuffer);
-        setFileName(file.name);
-      } catch (e) {
-        setError("DECODE ERROR");
-        console.error(e);
-      }
-    },
-    [engine, id]
-  );
+  const loadFile = useCallback(async (file: File) => {
+    if (loadDisabled) return;
+    setError("");
+    if (!file.type.startsWith("audio/") && !/\.(mp3|wav|ogg|flac|aac|m4a)$/i.test(file.name)) {
+      setError("UNSUPPORTED OR UNRECOGNIZED AUDIO");
+      return;
+    }
 
-  const handleFileInput = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) loadFile(file);
-    e.target.value = ""; // allow re-select same file
+    setIsLoading(true);
+    try {
+      const arrayBuffer = await file.arrayBuffer();
+      const fingerprintBuffer = arrayBuffer.slice(0);
+      const fingerprint = sha256Hex(fingerprintBuffer).catch(() => undefined);
+      await engine.loadBuffer(id, arrayBuffer);
+      const durationSec = engine.getDeckState(id).duration;
+      setWaveformPeaks(engine.getWaveformPeaks(id));
+      const sha256 = await fingerprint;
+      const identity: TrackIdentity = {
+        name: file.name,
+        size: file.size,
+        mimeType: file.type,
+        durationSec,
+        ...(sha256 ? { sha256 } : {}),
+      };
+      setFileName(file.name);
+      onTrackLoaded(id, identity);
+    } catch (loadError) {
+      setError("DECODE FAILED IN THIS BROWSER");
+      console.error(loadError);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [engine, id, loadDisabled, onTrackLoaded]);
+
+  const handleFileInput = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) void loadFile(file);
+    event.target.value = "";
   };
 
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
+  const handleDrop = (event: React.DragEvent) => {
+    event.preventDefault();
     setIsDragOver(false);
-    const file = e.dataTransfer.files?.[0];
-    if (file) loadFile(file);
+    const file = event.dataTransfer.files?.[0];
+    if (file) void loadFile(file);
   };
 
   const handlePlayPause = () => {
-    engine.resume();
-    if (state.isPlaying) {
-      engine.pause(id);
-      recorder.record(id, "pause", 0);
-    } else {
-      engine.play(id);
-      recorder.record(id, "play", 1);
-    }
-  };
-
-  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    engine.seek(id, val);
-    recorder.record(id, "seek", val);
-  };
-
-  const handleGain = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    engine.setGain(id, val);
-    recorder.record(id, "gain", val);
-  };
-
-  const handleFilter = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const val = parseFloat(e.target.value);
-    engine.setFilter(id, val);
-    recorder.record(id, "filter", val);
+    void engine.resume();
+    bus.dispatch(id, state.isPlaying ? "pause" : "play", state.isPlaying ? 0 : 1);
   };
 
   const hasTrack = engine.hasBuffer(id);
   const progress = state.duration > 0 ? state.currentTime / state.duration : 0;
+  const deckLabelId = `deck-${id.toLowerCase()}-label`;
+  const seekId = `deck-${id.toLowerCase()}-seek`;
+  const gainId = `deck-${id.toLowerCase()}-gain`;
+  const filterId = `deck-${id.toLowerCase()}-filter`;
+  const delayId = `deck-${id.toLowerCase()}-delay`;
+  const reverbId = `deck-${id.toLowerCase()}-reverb`;
 
   return (
-    <div
-      className={`deck deck-${id.toLowerCase()} ${isDragOver ? "deck--dragover" : ""}`}
-      onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
+    <section
+      className={`deck deck-${id.toLowerCase()} ${isDragOver ? "deck--dragover" : ""} ${controlsDisabled ? "deck--locked" : ""}`}
+      aria-labelledby={deckLabelId}
+      aria-busy={isLoading}
+      onDragOver={(event) => {
+        if (loadDisabled) return;
+        event.preventDefault();
+        setIsDragOver(true);
+      }}
       onDragLeave={() => setIsDragOver(false)}
       onDrop={handleDrop}
     >
       <div className="deck-header">
-        <span className="deck-label">DECK {id}</span>
+        <h2 className="deck-label" id={deckLabelId}>DECK {id}</h2>
         {hasTrack && <span className="deck-loaded">● LOADED</span>}
+        {controlsDisabled && <span className="deck-lock">GHOST LOCK</span>}
       </div>
 
-      {/* File loader */}
       <div className="deck-loader">
-        <label className="btn btn-file">
-          LOAD TRACK
-          <input type="file" accept="audio/*" onChange={handleFileInput} hidden />
-        </label>
-        <span className="deck-filename">
-          {error ? <span className="error">{error}</span> : (fileName || "DROP AUDIO HERE")}
+        <button
+          type="button"
+          className="btn btn-file"
+          onClick={() => inputRef.current?.click()}
+          disabled={loadDisabled || isLoading}
+        >
+          {isLoading ? "HASHING + DECODING…" : "LOAD TRACK"}
+        </button>
+        <input
+          ref={inputRef}
+          type="file"
+          accept="audio/*,.mp3,.wav,.ogg,.flac,.aac,.m4a"
+          onChange={handleFileInput}
+          hidden
+          disabled={loadDisabled}
+        />
+        <span className="deck-filename" title={fileName || undefined}>
+          {error ? <span className="error" role="alert">{error}</span> : (fileName || "DROP LOCAL AUDIO HERE")}
         </span>
       </div>
 
-      {/* Visualiser */}
-      <div className="visualiser-wrap">
-        <Visualiser
-          analyser={engine.getAnalyser(id)}
-          color={id === "A" ? "#00ff99" : "#ff6600"}
-        />
+      <div className="visualiser-label">LIVE SPECTRUM // PRE-FADER</div>
+      <div className="visualiser-wrap" aria-hidden="true">
+        <Visualiser analyser={engine.getAnalyser(id)} color={id === "A" ? "#00ff99" : "#ff7a29"} />
       </div>
 
-      {/* Progress bar */}
+      <WaveformOverview
+        peaks={waveformPeaks}
+        progress={progress}
+        duration={state.duration}
+        color={id === "A" ? "#00ff99" : "#ff7a29"}
+        disabled={controlsDisabled}
+        deckLabel={`Deck ${id}`}
+        onSeek={(seconds) => bus.dispatch(id, "seek", seconds)}
+      />
+
       <div className="progress-row">
-        <span className="timecode">{fmt(state.currentTime)}</span>
+        <span className="timecode">{formatTime(state.currentTime)}</span>
+        <label className="sr-only" htmlFor={seekId}>Deck {id} position</label>
         <input
+          id={seekId}
           type="range"
           className="seek-bar"
           min={0}
           max={state.duration || 1}
           step={0.01}
           value={state.currentTime}
-          onChange={handleSeek}
-          disabled={!hasTrack}
+          onChange={(event) => bus.dispatch(id, "seek", Number(event.target.value))}
+          disabled={!hasTrack || controlsDisabled}
+          aria-valuetext={`${formatTime(state.currentTime)} of ${formatTime(state.duration)}`}
         />
-        <span className="timecode">{fmt(state.duration)}</span>
+        <span className="timecode">{formatTime(state.duration)}</span>
       </div>
 
-      {/* Play/Pause */}
       <button
+        type="button"
         className={`btn btn-play ${state.isPlaying ? "btn-play--active" : ""}`}
         onClick={handlePlayPause}
-        disabled={!hasTrack}
+        disabled={!hasTrack || controlsDisabled}
       >
         {state.isPlaying ? "⏸ PAUSE" : "▶ PLAY"}
       </button>
 
-      {/* Gain */}
       <div className="knob-row">
-        <label className="knob-label">GAIN</label>
+        <label className="knob-label" htmlFor={gainId}>GAIN</label>
         <div className="knob-track-wrap">
           <input
+            id={gainId}
             type="range"
             className="knob-range"
             min={0}
             max={1.5}
             step={0.01}
             value={state.gain}
-            onChange={handleGain}
+            onChange={(event) => bus.dispatch(id, "gain", Number(event.target.value))}
+            disabled={controlsDisabled}
+            aria-valuetext={state.gain.toFixed(2)}
           />
           {ghostGain !== undefined && (
-            <div
-              className="ghost-marker"
-              style={{ left: `${(ghostGain / 1.5) * 100}%` }}
-              title={`GHOST GAIN: ${ghostGain.toFixed(2)}`}
-            />
+            <div className="ghost-marker" style={{ left: `${(ghostGain / 1.5) * 100}%` }} aria-hidden="true" />
           )}
         </div>
         <span className="knob-value">{state.gain.toFixed(2)}</span>
       </div>
 
-      {/* Low-pass filter */}
       <div className="knob-row">
-        <label className="knob-label">LPF</label>
+        <label className="knob-label" htmlFor={filterId}>LPF</label>
         <div className="knob-track-wrap">
           <input
+            id={filterId}
             type="range"
             className="knob-range"
-            min={200}
-            max={20000}
-            step={50}
-            value={state.filterFreq}
-            onChange={handleFilter}
+            min={0}
+            max={1}
+            step={0.001}
+            value={filterHzToUnit(state.filterFreq)}
+            onChange={(event) => bus.dispatch(id, "filter", filterUnitToHz(Number(event.target.value)))}
+            disabled={controlsDisabled}
+            aria-valuetext={`${Math.round(state.filterFreq)} hertz`}
           />
           {ghostFilter !== undefined && (
-            <div
-              className="ghost-marker"
-              style={{ left: `${((ghostFilter - 200) / (20000 - 200)) * 100}%` }}
-              title={`GHOST FILTER: ${Math.round(ghostFilter)}Hz`}
-            />
+            <div className="ghost-marker" style={{ left: `${filterHzToUnit(ghostFilter) * 100}%` }} aria-hidden="true" />
           )}
         </div>
         <span className="knob-value">{Math.round(state.filterFreq)}Hz</span>
       </div>
 
-      <div className="progress-px">
+      <div className="knob-row">
+        <label className="knob-label" htmlFor={delayId}>DELAY</label>
+        <div className="knob-track-wrap">
+          <input
+            id={delayId}
+            type="range"
+            className="knob-range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={state.delayMix}
+            onChange={(event) => bus.dispatch(id, "delay", Number(event.target.value))}
+            disabled={controlsDisabled}
+            aria-valuetext={`${Math.round(state.delayMix * 100)} percent, 375 millisecond echo`}
+          />
+          {ghostDelay !== undefined && (
+            <div className="ghost-marker" style={{ left: `${ghostDelay * 100}%` }} aria-hidden="true" />
+          )}
+        </div>
+        <span className="knob-value">{Math.round(state.delayMix * 100)}%</span>
+      </div>
+
+      <div className="knob-row">
+        <label className="knob-label" htmlFor={reverbId}>SPACE</label>
+        <div className="knob-track-wrap">
+          <input
+            id={reverbId}
+            type="range"
+            className="knob-range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={state.reverbMix}
+            onChange={(event) => bus.dispatch(id, "reverb", Number(event.target.value))}
+            disabled={controlsDisabled}
+            aria-valuetext={`${Math.round(state.reverbMix * 100)} percent reverb`}
+          />
+          {ghostReverb !== undefined && (
+            <div className="ghost-marker" style={{ left: `${ghostReverb * 100}%` }} aria-hidden="true" />
+          )}
+        </div>
+        <span className="knob-value">{Math.round(state.reverbMix * 100)}%</span>
+      </div>
+
+      <div className="deck-quick-actions">
+        <button
+          type="button"
+          className="btn btn-reset"
+          onClick={() => bus.dispatch(id, "filter", 20_000)}
+          disabled={controlsDisabled || state.filterFreq >= 19_999}
+        >
+          CLEAR LPF
+        </button>
+        <button
+          type="button"
+          className="btn btn-reset"
+          onClick={() => {
+            bus.dispatch(id, "delay", 0);
+            bus.dispatch(id, "reverb", 0);
+          }}
+          disabled={controlsDisabled || (state.delayMix === 0 && state.reverbMix === 0)}
+        >
+          CLEAR FX
+        </button>
+      </div>
+
+      <div className="progress-px" aria-hidden="true">
         <div className="progress-px-fill" style={{ width: `${progress * 100}%` }} />
       </div>
-    </div>
+    </section>
   );
 }

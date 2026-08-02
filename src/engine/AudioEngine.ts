@@ -1,12 +1,23 @@
 /**
- * AudioEngine
- * Manages all Web Audio API nodes for both decks plus the master crossfader.
- * Graph per deck:
- *   BufferSourceNode -> GainNode (deck gain) -> BiquadFilterNode (low-pass) -> GainNode (xfade side) -> destination
- * Analyser is tapped after the xfade gains and merged for the visualiser.
+ * Web Audio graph and the defensive boundary for every deck control.
+ *
+ * Per deck:
+ *   source -> gain -> low-pass -> pre-fader analyser -> xfade gain
+ * Both decks:
+ *   -> master gain -> safety limiter -> master analyser -> destination
  */
 
-export type DeckId = "A" | "B";
+import type { ControlBus, ControlEvent, DeckId } from "./ControlBus";
+import {
+  clamp,
+  equalPowerGains,
+  MAX_DECK_GAIN,
+  MAX_FILTER_HZ,
+  MIN_FILTER_HZ,
+} from "./AudioMath";
+import { computeWaveformPeaks } from "./Waveform";
+
+export type { DeckId } from "./ControlBus";
 
 export interface DeckState {
   isPlaying: boolean;
@@ -14,12 +25,14 @@ export interface DeckState {
   duration: number;
   gain: number;
   filterFreq: number;
+  delayMix: number;
+  reverbMix: number;
 }
 
 export interface EngineSnapshot {
   A: DeckState;
   B: DeckState;
-  crossfader: number; // 0..1
+  crossfader: number;
 }
 
 interface DeckNodes {
@@ -27,166 +40,358 @@ interface DeckNodes {
   filterNode: BiquadFilterNode;
   xfadeGain: GainNode;
   analyser: AnalyserNode;
+  delayNode: DelayNode;
+  delayFeedback: GainNode;
+  delayWet: GainNode;
+  reverbNode: ConvolverNode;
+  reverbWet: GainNode;
   source: AudioBufferSourceNode | null;
   buffer: AudioBuffer | null;
-  startedAt: number; // audioContext.currentTime when source was started
-  pausedAt: number;  // buffer offset when paused
+  startedAt: number;
+  pausedAt: number;
   isPlaying: boolean;
   gain: number;
   filterFreq: number;
+  delayMix: number;
+  reverbMix: number;
 }
 
 export class AudioEngine {
   readonly ctx: AudioContext;
-  private decks: Record<DeckId, DeckNodes>;
-  crossfaderValue = 0.5; // 0 = full A, 1 = full B
+  private readonly masterGain: GainNode;
+  private readonly limiter: DynamicsCompressorNode;
+  private readonly masterAnalyser: AnalyserNode;
+  private readonly reverbImpulse: AudioBuffer;
+  private readonly decks: Record<DeckId, DeckNodes>;
+  private unsubscribe: (() => void) | null;
+  crossfaderValue = 0.5;
 
-  constructor() {
+  constructor(bus: ControlBus) {
     this.ctx = new AudioContext();
-    this.decks = {
-      A: this._createDeck(),
-      B: this._createDeck(),
-    };
-    this._updateXfade(0.5);
+
+    this.masterGain = this.ctx.createGain();
+    this.masterGain.gain.value = 0.85;
+
+    this.limiter = this.ctx.createDynamicsCompressor();
+    this.limiter.threshold.value = -1;
+    this.limiter.knee.value = 0;
+    this.limiter.ratio.value = 20;
+    this.limiter.attack.value = 0.003;
+    this.limiter.release.value = 0.1;
+
+    this.masterAnalyser = this.ctx.createAnalyser();
+    this.masterAnalyser.fftSize = 256;
+    this.masterGain.connect(this.limiter);
+    this.limiter.connect(this.masterAnalyser);
+    this.masterAnalyser.connect(this.ctx.destination);
+
+    this.reverbImpulse = this.createReverbImpulse();
+
+    this.decks = { A: this.createDeck(), B: this.createDeck() };
+    this.updateCrossfader(0.5, true);
+    this.unsubscribe = bus.subscribe((event) => this.handleEvent(event));
   }
 
-  private _createDeck(): DeckNodes {
-    const { ctx } = this;
-    const gainNode = ctx.createGain();
-    const filterNode = ctx.createBiquadFilter();
+  private createDeck(): DeckNodes {
+    const gainNode = this.ctx.createGain();
+    const filterNode = this.ctx.createBiquadFilter();
+    const analyser = this.ctx.createAnalyser();
+    const xfadeGain = this.ctx.createGain();
+
     filterNode.type = "lowpass";
-    filterNode.frequency.value = 20000;
-    const xfadeGain = ctx.createGain();
-    const analyser = ctx.createAnalyser();
+    filterNode.frequency.value = MAX_FILTER_HZ;
     analyser.fftSize = 256;
 
     gainNode.connect(filterNode);
-    filterNode.connect(xfadeGain);
-    xfadeGain.connect(analyser);
-    analyser.connect(ctx.destination);
+    filterNode.connect(analyser);
+    const effects = this.connectEffects(analyser, xfadeGain);
+    xfadeGain.connect(this.masterGain);
 
     return {
       gainNode,
       filterNode,
-      xfadeGain,
       analyser,
+      xfadeGain,
+      ...effects,
       source: null,
       buffer: null,
       startedAt: 0,
       pausedAt: 0,
       isPlaying: false,
       gain: 1,
-      filterFreq: 20000,
+      filterFreq: MAX_FILTER_HZ,
+      delayMix: 0,
+      reverbMix: 0,
     };
+  }
+
+  private createReverbImpulse(): AudioBuffer {
+    const durationSec = 1.6;
+    const length = Math.ceil(this.ctx.sampleRate * durationSec);
+    const impulse = this.ctx.createBuffer(2, length, this.ctx.sampleRate);
+    let seed = 0x47484f53;
+    const random = () => {
+      seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0;
+      return seed / 0xffffffff;
+    };
+    for (let channel = 0; channel < impulse.numberOfChannels; channel += 1) {
+      const data = impulse.getChannelData(channel);
+      for (let index = 0; index < length; index += 1) {
+        const envelope = Math.pow(1 - index / length, 2.8);
+        data[index] = (random() * 2 - 1) * envelope;
+      }
+    }
+    return impulse;
+  }
+
+  private connectEffects(analyser: AnalyserNode, xfadeGain: GainNode) {
+    const delayNode = this.ctx.createDelay(1);
+    const delayFeedback = this.ctx.createGain();
+    const delayWet = this.ctx.createGain();
+    const reverbNode = this.ctx.createConvolver();
+    const reverbWet = this.ctx.createGain();
+
+    delayNode.delayTime.value = 0.375;
+    delayFeedback.gain.value = 0.32;
+    delayWet.gain.value = 0;
+    reverbNode.buffer = this.reverbImpulse;
+    reverbWet.gain.value = 0;
+
+    analyser.connect(xfadeGain);
+    analyser.connect(delayNode);
+    delayNode.connect(delayWet);
+    delayWet.connect(xfadeGain);
+    delayNode.connect(delayFeedback);
+    delayFeedback.connect(delayNode);
+    analyser.connect(reverbNode);
+    reverbNode.connect(reverbWet);
+    reverbWet.connect(xfadeGain);
+
+    return { delayNode, delayFeedback, delayWet, reverbNode, reverbWet };
+  }
+
+  private rebuildEffects(deck: DeckId) {
+    const state = this.decks[deck];
+    state.analyser.disconnect();
+    state.delayNode.disconnect();
+    state.delayFeedback.disconnect();
+    state.delayWet.disconnect();
+    state.reverbNode.disconnect();
+    state.reverbWet.disconnect();
+    Object.assign(state, this.connectEffects(state.analyser, state.xfadeGain));
+  }
+
+  private handleEvent(event: ControlEvent) {
+    if (event.control === "crossfader") {
+      if (event.deck === "master") this.setCrossfader(event.value);
+      return;
+    }
+    if (event.deck !== "A" && event.deck !== "B") return;
+
+    switch (event.control) {
+      case "play":
+        this.play(event.deck);
+        break;
+      case "pause":
+        this.pause(event.deck);
+        break;
+      case "seek":
+        this.seek(event.deck, event.value);
+        break;
+      case "gain":
+        this.setGain(event.deck, event.value);
+        break;
+      case "filter":
+        this.setFilter(event.deck, event.value);
+        break;
+      case "delay":
+        this.setDelay(event.deck, event.value);
+        break;
+      case "reverb":
+        this.setReverb(event.deck, event.value);
+        break;
+    }
   }
 
   async resume() {
+    if (this.ctx.state === "closed") throw new Error("Audio engine is closed");
     if (this.ctx.state === "suspended") await this.ctx.resume();
   }
 
-  /** Load an ArrayBuffer into a deck, decoding it as PCM. */
   async loadBuffer(deck: DeckId, arrayBuffer: ArrayBuffer): Promise<void> {
     await this.resume();
     const buffer = await this.ctx.decodeAudioData(arrayBuffer);
-    const d = this.decks[deck];
-    if (d.isPlaying) this._stopSource(deck);
-    d.buffer = buffer;
-    d.pausedAt = 0;
+    const state = this.decks[deck];
+    this.stopSource(deck);
+    this.rebuildEffects(deck);
+    this.setDelay(deck, state.delayMix, true);
+    this.setReverb(deck, state.reverbMix, true);
+    state.buffer = buffer;
+    state.pausedAt = 0;
   }
 
   play(deck: DeckId) {
-    const d = this.decks[deck];
-    if (!d.buffer || d.isPlaying) return;
-    this._startSource(deck, d.pausedAt);
+    const state = this.decks[deck];
+    if (!state.buffer || state.isPlaying) return;
+    if (state.pausedAt >= state.buffer.duration) state.pausedAt = 0;
+    this.startSource(deck, state.pausedAt);
   }
 
   pause(deck: DeckId) {
-    const d = this.decks[deck];
-    if (!d.isPlaying) return;
-    const elapsed = this.ctx.currentTime - d.startedAt;
-    d.pausedAt = Math.min(elapsed, d.buffer?.duration ?? 0);
-    this._stopSource(deck);
+    const state = this.decks[deck];
+    if (!state.isPlaying) return;
+    const elapsed = this.ctx.currentTime - state.startedAt;
+    state.pausedAt = clamp(elapsed, 0, state.buffer?.duration ?? 0);
+    this.stopSource(deck);
+  }
+
+  stopAll() {
+    this.pause("A");
+    this.pause("B");
+    for (const deck of ["A", "B"] as const) {
+      const state = this.decks[deck];
+      this.rebuildEffects(deck);
+      this.setDelay(deck, state.delayMix, true);
+      this.setReverb(deck, state.reverbMix, true);
+    }
   }
 
   seek(deck: DeckId, positionSec: number) {
-    const d = this.decks[deck];
-    if (!d.buffer) return;
-    const wasPlaying = d.isPlaying;
-    if (wasPlaying) this._stopSource(deck);
-    d.pausedAt = Math.max(0, Math.min(positionSec, d.buffer.duration));
-    if (wasPlaying) this._startSource(deck, d.pausedAt);
+    const state = this.decks[deck];
+    if (!state.buffer || !Number.isFinite(positionSec)) return;
+    const wasPlaying = state.isPlaying;
+    if (wasPlaying) this.stopSource(deck);
+    state.pausedAt = clamp(positionSec, 0, state.buffer.duration);
+    if (wasPlaying) this.startSource(deck, state.pausedAt);
   }
 
-  setGain(deck: DeckId, value: number) {
-    const d = this.decks[deck];
-    d.gain = value;
-    d.gainNode.gain.setTargetAtTime(value, this.ctx.currentTime, 0.01);
+  setGain(deck: DeckId, value: number, immediate = false) {
+    if (!Number.isFinite(value)) return;
+    const state = this.decks[deck];
+    state.gain = clamp(value, 0, MAX_DECK_GAIN);
+    this.setAudioParam(state.gainNode.gain, state.gain, immediate);
   }
 
-  setFilter(deck: DeckId, freqHz: number) {
-    const d = this.decks[deck];
-    d.filterFreq = freqHz;
-    d.filterNode.frequency.setTargetAtTime(freqHz, this.ctx.currentTime, 0.01);
+  setFilter(deck: DeckId, freqHz: number, immediate = false) {
+    if (!Number.isFinite(freqHz)) return;
+    const state = this.decks[deck];
+    state.filterFreq = clamp(freqHz, MIN_FILTER_HZ, MAX_FILTER_HZ);
+    this.setAudioParam(state.filterNode.frequency, state.filterFreq, immediate);
   }
 
-  setCrossfader(value: number) {
-    this.crossfaderValue = Math.max(0, Math.min(1, value));
-    this._updateXfade(this.crossfaderValue);
+  setDelay(deck: DeckId, value: number, immediate = false) {
+    if (!Number.isFinite(value)) return;
+    const state = this.decks[deck];
+    state.delayMix = clamp(value, 0, 1);
+    this.setAudioParam(state.delayWet.gain, state.delayMix * 0.7, immediate);
   }
 
-  private _updateXfade(v: number) {
-    // Equal-power crossfade
-    const angle = (v * Math.PI) / 2;
-    const gainA = Math.cos(angle);
-    const gainB = Math.sin(angle);
+  setReverb(deck: DeckId, value: number, immediate = false) {
+    if (!Number.isFinite(value)) return;
+    const state = this.decks[deck];
+    state.reverbMix = clamp(value, 0, 1);
+    this.setAudioParam(state.reverbWet.gain, state.reverbMix * 0.65, immediate);
+  }
+
+  setCrossfader(value: number, immediate = false) {
+    if (!Number.isFinite(value)) return;
+    this.crossfaderValue = clamp(value, 0, 1);
+    this.updateCrossfader(this.crossfaderValue, immediate);
+  }
+
+  private setAudioParam(param: AudioParam, value: number, immediate: boolean) {
     const now = this.ctx.currentTime;
-    this.decks.A.xfadeGain.gain.setTargetAtTime(gainA, now, 0.01);
-    this.decks.B.xfadeGain.gain.setTargetAtTime(gainB, now, 0.01);
+    param.cancelScheduledValues(now);
+    if (immediate) param.setValueAtTime(value, now);
+    else param.setTargetAtTime(value, now, 0.01);
   }
 
-  private _startSource(deck: DeckId, offset: number) {
-    const d = this.decks[deck];
-    if (!d.buffer) return;
-    const src = this.ctx.createBufferSource();
-    src.buffer = d.buffer;
-    src.connect(d.gainNode);
-    src.start(0, offset);
-    src.onended = () => {
-      if (d.source === src) {
-        d.isPlaying = false;
-        d.source = null;
-        d.pausedAt = 0;
-      }
+  private updateCrossfader(value: number, immediate: boolean) {
+    const gains = equalPowerGains(value);
+    this.setAudioParam(this.decks.A.xfadeGain.gain, gains.A, immediate);
+    this.setAudioParam(this.decks.B.xfadeGain.gain, gains.B, immediate);
+  }
+
+  private startSource(deck: DeckId, requestedOffset: number) {
+    const state = this.decks[deck];
+    if (!state.buffer || state.buffer.duration <= 0) return;
+
+    const endSafeOffset = Math.max(0, state.buffer.duration - 0.001);
+    const offset = clamp(requestedOffset, 0, endSafeOffset);
+    const source = this.ctx.createBufferSource();
+    source.buffer = state.buffer;
+    source.connect(state.gainNode);
+    source.start(0, offset);
+    source.onended = () => {
+      if (state.source !== source) return;
+      state.isPlaying = false;
+      state.source = null;
+      state.pausedAt = 0;
     };
-    d.source = src;
-    d.startedAt = this.ctx.currentTime - offset;
-    d.isPlaying = true;
+
+    state.source = source;
+    state.startedAt = this.ctx.currentTime - offset;
+    state.pausedAt = offset;
+    state.isPlaying = true;
   }
 
-  private _stopSource(deck: DeckId) {
-    const d = this.decks[deck];
-    if (!d.source) return;
-    try { d.source.stop(); } catch { /* already stopped */ }
-    d.source.disconnect();
-    d.source = null;
-    d.isPlaying = false;
+  private stopSource(deck: DeckId) {
+    const state = this.decks[deck];
+    if (!state.source) {
+      state.isPlaying = false;
+      return;
+    }
+    state.source.onended = null;
+    try {
+      state.source.stop();
+    } catch {
+      // Source may already have ended between the state read and stop().
+    }
+    state.source.disconnect();
+    state.source = null;
+    state.isPlaying = false;
   }
 
   getAnalyser(deck: DeckId): AnalyserNode {
     return this.decks[deck].analyser;
   }
 
+  getMasterAnalyser(): AnalyserNode {
+    return this.masterAnalyser;
+  }
+
+  getWaveformPeaks(deck: DeckId, bucketCount = 320): number[] {
+    const buffer = this.decks[deck].buffer;
+    if (!buffer) return [];
+    const channels = Array.from(
+      { length: buffer.numberOfChannels },
+      (_, channel) => buffer.getChannelData(channel),
+    );
+    return computeWaveformPeaks(channels, bucketCount);
+  }
+
   getDeckState(deck: DeckId): DeckState {
-    const d = this.decks[deck];
-    const currentTime = d.isPlaying
-      ? this.ctx.currentTime - d.startedAt
-      : d.pausedAt;
+    const state = this.decks[deck];
+    const duration = state.buffer?.duration ?? 0;
+    const currentTime = state.isPlaying
+      ? this.ctx.currentTime - state.startedAt
+      : state.pausedAt;
     return {
-      isPlaying: d.isPlaying,
-      currentTime: Math.max(0, currentTime),
-      duration: d.buffer?.duration ?? 0,
-      gain: d.gain,
-      filterFreq: d.filterFreq,
+      isPlaying: state.isPlaying,
+      currentTime: clamp(currentTime, 0, duration),
+      duration,
+      gain: state.gain,
+      filterFreq: state.filterFreq,
+      delayMix: state.delayMix,
+      reverbMix: state.reverbMix,
+    };
+  }
+
+  getSnapshot(): EngineSnapshot {
+    return {
+      A: this.getDeckState("A"),
+      B: this.getDeckState("B"),
+      crossfader: this.crossfaderValue,
     };
   }
 
@@ -195,18 +400,59 @@ export class AudioEngine {
   }
 
   resetDeck(deck: DeckId) {
-    this._stopSource(deck);
-    const d = this.decks[deck];
-    d.pausedAt = 0;
-    d.gain = 1;
-    d.gainNode.gain.value = 1;
-    d.filterFreq = 20000;
-    d.filterNode.frequency.value = 20000;
+    this.stopSource(deck);
+    const state = this.decks[deck];
+    this.rebuildEffects(deck);
+    state.pausedAt = 0;
+    this.setGain(deck, 1, true);
+    this.setFilter(deck, MAX_FILTER_HZ, true);
+    this.setDelay(deck, 0, true);
+    this.setReverb(deck, 0, true);
   }
 
   resetAll() {
     this.resetDeck("A");
     this.resetDeck("B");
-    this.setCrossfader(0.5);
+    this.setCrossfader(0.5, true);
+  }
+
+  /** Restore mixer values, cue positions, then start decks captured as playing. */
+  applySnapshot(snapshot: EngineSnapshot) {
+    this.resetDeck("A");
+    this.resetDeck("B");
+
+    for (const deck of ["A", "B"] as const) {
+      this.setGain(deck, snapshot[deck].gain, true);
+      this.setFilter(deck, snapshot[deck].filterFreq, true);
+      this.setDelay(deck, snapshot[deck].delayMix, true);
+      this.setReverb(deck, snapshot[deck].reverbMix, true);
+      this.seek(deck, snapshot[deck].currentTime);
+    }
+    this.setCrossfader(snapshot.crossfader, true);
+
+    if (snapshot.A.isPlaying) this.play("A");
+    if (snapshot.B.isPlaying) this.play("B");
+  }
+
+  async destroy() {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+    this.stopSource("A");
+    this.stopSource("B");
+    for (const deck of ["A", "B"] as const) {
+      this.decks[deck].gainNode.disconnect();
+      this.decks[deck].filterNode.disconnect();
+      this.decks[deck].analyser.disconnect();
+      this.decks[deck].xfadeGain.disconnect();
+      this.decks[deck].delayNode.disconnect();
+      this.decks[deck].delayFeedback.disconnect();
+      this.decks[deck].delayWet.disconnect();
+      this.decks[deck].reverbNode.disconnect();
+      this.decks[deck].reverbWet.disconnect();
+    }
+    this.masterGain.disconnect();
+    this.limiter.disconnect();
+    this.masterAnalyser.disconnect();
+    if (this.ctx.state !== "closed") await this.ctx.close();
   }
 }

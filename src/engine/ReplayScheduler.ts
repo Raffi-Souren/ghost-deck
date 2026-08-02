@@ -1,95 +1,141 @@
-/**
- * ReplayScheduler
- * Replays a recorded trace against a live AudioEngine.
- * Scheduling uses a combination of AudioContext.currentTime (for audio nodes)
- * and setTimeout (for UI/state callbacks).
- */
+/** Absolute-clock ghost replay with measured dispatch drift. */
 
-import type { TraceEvent } from "./TraceRecorder";
-import type { AudioEngine, DeckId } from "./AudioEngine";
+import type { ControlBus, ControlEvent } from "./ControlBus";
+import type { TraceSession } from "./TraceRecorder";
+import {
+  calculateReplayReport,
+  type ReplayEventResult,
+  type ReplayTimingReport,
+} from "./ReplayMetrics";
 
-export type ReplayCallback = (event: TraceEvent) => void;
+export interface ReplaySchedulerOptions {
+  clock?: () => number;
+  tickIntervalMs?: number;
+  onDone: (report: ReplayTimingReport) => void;
+}
+
+interface ActiveReplay {
+  events: ControlEvent[];
+  durationMs: number;
+  bus: ControlBus;
+  clock: () => number;
+  tickIntervalMs: number;
+  onDone: (report: ReplayTimingReport) => void;
+  startedAtMs: number;
+  cursor: number;
+  results: ReplayEventResult[];
+}
 
 export class ReplayScheduler {
-  private timers: ReturnType<typeof setTimeout>[] = [];
-  private _replaying = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private active: ActiveReplay | null = null;
+  private lastProgressMs = 0;
 
   get replaying() {
-    return this._replaying;
+    return this.active !== null;
   }
 
-  /**
-   * Schedule all events.
-   * @param events  Recorded trace events (timestampMs offsets from 0)
-   * @param engine  Live AudioEngine instance
-   * @param onEvent Called on the UI thread just before each event fires (for ghost overlay updates)
-   * @param onDone  Called when the last event has fired
-   */
+  get progressMs() {
+    if (!this.active) return this.lastProgressMs;
+    return Math.min(
+      this.active.durationMs,
+      Math.max(0, this.active.clock() - this.active.startedAtMs),
+    );
+  }
+
   start(
-    events: TraceEvent[],
-    engine: AudioEngine,
-    onEvent: ReplayCallback,
-    onDone: () => void
+    trace: Pick<TraceSession, "events" | "durationMs">,
+    bus: ControlBus,
+    options: ReplaySchedulerOptions,
   ) {
-    this.stop(); // clear any previous replay
-    if (events.length === 0) {
-      onDone();
+    this.stop();
+
+    const clock = options.clock ?? (() => performance.now());
+    const events = trace.events
+      .map((event, index) => ({ event: { ...event }, index }))
+      .sort((a, b) => a.event.timestampMs - b.event.timestampMs || a.index - b.index)
+      .map(({ event }) => event);
+    const finalEventMs = events.at(-1)?.timestampMs ?? 0;
+
+    this.lastProgressMs = 0;
+    this.active = {
+      events,
+      durationMs: Math.max(trace.durationMs, finalEventMs),
+      bus,
+      clock,
+      tickIntervalMs: Math.max(4, options.tickIntervalMs ?? 20),
+      onDone: options.onDone,
+      startedAtMs: clock(),
+      cursor: 0,
+      results: [],
+    };
+
+    this.tick();
+  }
+
+  stop(): ReplayTimingReport | null {
+    if (!this.active) return null;
+    return this.finish("interrupted", false);
+  }
+
+  reset() {
+    this.stop();
+    this.lastProgressMs = 0;
+  }
+
+  private tick = () => {
+    const active = this.active;
+    if (!active) return;
+
+    const elapsedMs = Math.max(0, active.clock() - active.startedAtMs);
+    this.lastProgressMs = Math.min(active.durationMs, elapsedMs);
+
+    while (
+      active.cursor < active.events.length &&
+      active.events[active.cursor].timestampMs <= elapsedMs
+    ) {
+      const index = active.cursor;
+      const event = active.events[index];
+      active.bus.dispatchEvent({ ...event, source: "ghost" });
+      const actualTimestampMs = Math.max(0, active.clock() - active.startedAtMs);
+      active.results.push({
+        eventIndex: index,
+        targetTimestampMs: event.timestampMs,
+        actualTimestampMs,
+        driftMs: actualTimestampMs - event.timestampMs,
+      });
+      active.cursor += 1;
+    }
+
+    if (active.cursor >= active.events.length && elapsedMs >= active.durationMs) {
+      this.finish("completed", true);
       return;
     }
 
-    this._replaying = true;
-    const wallStart = performance.now();
+    const nextEventMs = active.events[active.cursor]?.timestampMs ?? active.durationMs;
+    const nextTargetMs = Math.min(nextEventMs, active.durationMs);
+    const delayMs = Math.max(0, Math.min(active.tickIntervalMs, nextTargetMs - elapsedMs));
+    this.timer = setTimeout(this.tick, delayMs);
+  };
 
-    events.forEach((evt, idx) => {
-      const timer = setTimeout(() => {
-        if (!this._replaying) return;
+  private finish(status: "completed" | "interrupted", notify: boolean): ReplayTimingReport {
+    const active = this.active;
+    if (!active) throw new Error("No replay is active");
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
 
-        // Apply to audio engine
-        this._applyEvent(evt, engine);
-
-        // Notify UI
-        onEvent(evt);
-
-        if (idx === events.length - 1) {
-          this._replaying = false;
-          onDone();
-        }
-      }, evt.timestampMs);
-      this.timers.push(timer);
-    });
-
-    // Suppress "wallStart unused" lint – it's here for future drift correction
-    void wallStart;
-  }
-
-  stop() {
-    this.timers.forEach(clearTimeout);
-    this.timers = [];
-    this._replaying = false;
-  }
-
-  private _applyEvent(evt: TraceEvent, engine: AudioEngine) {
-    const deck = evt.deck as DeckId; // "A" | "B" – master handled separately
-
-    switch (evt.control) {
-      case "play":
-        engine.play(deck);
-        break;
-      case "pause":
-        engine.pause(deck);
-        break;
-      case "seek":
-        engine.seek(deck, evt.value);
-        break;
-      case "gain":
-        engine.setGain(deck, evt.value);
-        break;
-      case "filter":
-        engine.setFilter(deck, evt.value);
-        break;
-      case "crossfader":
-        engine.setCrossfader(evt.value);
-        break;
-    }
+    const actualDurationMs = Math.max(0, active.clock() - active.startedAtMs);
+    this.lastProgressMs = Math.min(active.durationMs, actualDurationMs);
+    const report = calculateReplayReport(
+      status,
+      active.events.length,
+      active.durationMs,
+      actualDurationMs,
+      active.results,
+    );
+    const onDone = active.onDone;
+    this.active = null;
+    if (notify) onDone(report);
+    return report;
   }
 }
