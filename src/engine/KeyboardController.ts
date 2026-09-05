@@ -25,9 +25,9 @@ export class KeyboardController {
 
   constructor(bus: ControlBus, engine: AudioEngine) {
     this._handler = (e: KeyboardEvent) => {
-      if (!this.enabled) return;
+      if (!this.enabled || e.defaultPrevented) return;
       const target = e.target instanceof Element ? e.target : null;
-      if (target?.closest("input, textarea, select, button, [contenteditable='true']")) return;
+      if (target?.closest("input, textarea, select, button, a, summary, [role='slider'], [contenteditable='true']")) return;
 
       const stateA = engine.getDeckState("A");
       const stateB = engine.getDeckState("B");

@@ -6,6 +6,7 @@ import { filterHzToUnit } from "../engine/AudioMath";
 interface Props {
   trace: TraceSession | null;
   isReplaying: boolean;
+  isRecording: boolean;
   getReplayProgressMs: () => number;
 }
 
@@ -75,7 +76,7 @@ function buildStepPath(lane: Lane, events: ControlEvent[], durationMs: number, l
   return path;
 }
 
-export function TraceTimeline({ trace, isReplaying, getReplayProgressMs }: Props) {
+export function TraceTimeline({ trace, isReplaying, isRecording, getReplayProgressMs }: Props) {
   const cursorRef = useRef<SVGLineElement>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
 
@@ -212,22 +213,42 @@ export function TraceTimeline({ trace, isReplaying, getReplayProgressMs }: Props
   }, [getReplayProgressMs, isReplaying, trace]);
 
   const handleKeyboard = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!["ArrowRight", "ArrowLeft", "Home", "End", "Escape"].includes(event.key)) return;
+    event.preventDefault();
+    event.stopPropagation();
     if (sortedEvents.length === 0) return;
     if (event.key === "ArrowRight") {
-      event.preventDefault();
       setSelectedIndex((current) => Math.min(sortedEvents.length - 1, (current ?? -1) + 1));
     } else if (event.key === "ArrowLeft") {
-      event.preventDefault();
       setSelectedIndex((current) => Math.max(0, (current ?? 1) - 1));
     } else if (event.key === "Home") {
-      event.preventDefault();
       setSelectedIndex(0);
     } else if (event.key === "End") {
-      event.preventDefault();
       setSelectedIndex(sortedEvents.length - 1);
     } else if (event.key === "Escape") {
       setSelectedIndex(null);
     }
+  };
+
+  const handleTimelineClick = (event: React.MouseEvent<SVGSVGElement>) => {
+    if (!trace || sortedEvents.length === 0) return;
+    const transform = event.currentTarget.getScreenCTM();
+    if (!transform) return;
+
+    // The SVG transform includes its responsive scale, border, and viewBox padding.
+    const point = new DOMPoint(event.clientX, event.clientY).matrixTransform(transform.inverse());
+    const timestampMs = clamp01((point.x - LEFT) / (RIGHT - LEFT)) * trace.durationMs;
+    let nearestIndex = 0;
+    let nearestDistance = Infinity;
+    for (let index = 0; index < sortedEvents.length; index += 1) {
+      const distance = Math.abs(sortedEvents[index].timestampMs - timestampMs);
+      if (distance < nearestDistance) {
+        nearestIndex = index;
+        nearestDistance = distance;
+      }
+    }
+    setSelectedIndex(nearestIndex);
+    event.currentTarget.closest<HTMLElement>(".trace-timeline")?.focus({ preventScroll: true });
   };
 
   const selected = selectedIndex === null ? null : sortedEvents[selectedIndex];
@@ -239,57 +260,99 @@ export function TraceTimeline({ trace, isReplaying, getReplayProgressMs }: Props
     <section
       className="trace-timeline"
       aria-labelledby="trace-path-title"
+      aria-describedby={trace ? "trace-inspector" : undefined}
       tabIndex={0}
       onKeyDown={handleKeyboard}
     >
       <div className="trace-timeline-header">
         <h2 id="trace-path-title">TRACE PATH</h2>
-        <span>{trace ? `${trace.events.length} EVENTS · ${(trace.durationMs / 1000).toFixed(2)}s` : "NO TRACE"}</span>
+        <span>{trace ? `${trace.events.length} EVENTS · ${(trace.durationMs / 1000).toFixed(2)}s` : isRecording ? "● RECORDING" : "NO TRACE"}</span>
       </div>
 
       {!trace ? (
-        <div className="trace-empty">NO TRACE IN MEMORY — RECORD OR IMPORT A TRANSITION</div>
+        <div className="trace-empty">
+          <svg className="trace-empty-illustration" viewBox="0 0 176 60" width="176" height="60" aria-hidden="true">
+            <path d="M 8 12 H 168 M 8 30 H 168 M 8 48 H 168" fill="none" stroke="var(--border)" />
+            <path d="M 8 18 H 48 V 26 H 82 V 42 H 168" fill="none" stroke="var(--accent-a)" strokeWidth="2" />
+            <path d="M 8 48 H 82 V 36 H 122 V 16 H 168" fill="none" stroke="var(--accent-b)" strokeWidth="2" />
+            <path d="M 82 5 V 55" fill="none" stroke="var(--accent-ghost)" strokeDasharray="3 4" />
+            <circle cx="82" cy="5" r="3" fill="var(--accent-ghost)" />
+          </svg>
+          <div className="trace-empty-copy">
+            <h3 className="trace-empty-title">{isRecording ? "The moment is being captured." : "Your next transition starts here."}</h3>
+            <p className="trace-empty-hint">{isRecording ? "Shape the sound. Move the crossfader. Press Stop to reveal your trace." : "Press Record, mix the decks, then Stop to see every move."}</p>
+          </div>
+        </div>
       ) : (
         <>
-          <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="trace-svg" aria-hidden="true">
-            {lanes.map((lane, index) => {
-              const y = TOP + index * LANE_HEIGHT;
-              return (
-                <g key={lane.label}>
-                  <rect x={LEFT} y={y} width={RIGHT - LEFT} height={24} className="trace-lane-bg" />
-                  <text x={8} y={y + 16} className="trace-lane-label">{lane.label}</text>
-                  <path
-                    d={paths[index]}
-                    fill="none"
-                    stroke={lane.color}
-                    strokeWidth="2"
-                    strokeDasharray={lane.dashed ? "5 4" : undefined}
-                    vectorEffect="non-scaling-stroke"
-                  />
-                </g>
-              );
-            })}
+          <div className="trace-chart-scroll">
+            <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="trace-svg" aria-hidden="true" onClick={handleTimelineClick}>
+              {lanes.map((lane, index) => {
+                const y = TOP + index * LANE_HEIGHT;
+                return (
+                  <g key={lane.label}>
+                    <rect x={LEFT} y={y} width={RIGHT - LEFT} height={24} className="trace-lane-bg" />
+                    <text x={8} y={y + 16} className="trace-lane-label">{lane.label}</text>
+                    <path
+                      d={paths[index]}
+                      fill="none"
+                      stroke={lane.color}
+                      strokeWidth="2"
+                      strokeDasharray={lane.dashed ? "5 4" : undefined}
+                      vectorEffect="non-scaling-stroke"
+                    />
+                  </g>
+                );
+              })}
 
-            {transportEvents.map((event, index) => {
-              const x = LEFT + clamp01(event.timestampMs / Math.max(1, trace.durationMs)) * (RIGHT - LEFT);
-              const y = event.deck === "A" ? 368 : 384;
-              const symbol = event.control === "play" ? "▶" : event.control === "pause" ? "Ⅱ" : "◆";
-              return <text key={`${event.timestampMs}-${index}`} x={x} y={y} className={`trace-marker trace-marker--${event.deck.toLowerCase()}`}>{symbol}</text>;
-            })}
+              {transportEvents.map((event, index) => {
+                const x = LEFT + clamp01(event.timestampMs / Math.max(1, trace.durationMs)) * (RIGHT - LEFT);
+                const y = event.deck === "A" ? 368 : 384;
+                const symbol = event.control === "play" ? "▶" : event.control === "pause" ? "Ⅱ" : "◆";
+                return <text key={`${event.timestampMs}-${index}`} x={x} y={y} className={`trace-marker trace-marker--${event.deck.toLowerCase()}`}>{symbol}</text>;
+              })}
 
-            <line ref={cursorRef} x1={LEFT} x2={LEFT} y1={TOP - 5} y2={HEIGHT - 3} className="trace-cursor" />
-            {selectedX !== null && (
-              <line x1={selectedX} x2={selectedX} y1={TOP - 5} y2={HEIGHT - 3} className="trace-selection" />
-            )}
-          </svg>
+              <line ref={cursorRef} x1={LEFT} x2={LEFT} y1={TOP - 5} y2={HEIGHT - 3} className="trace-cursor" />
+              {selectedX !== null && (
+                <line x1={selectedX} x2={selectedX} y1={TOP - 5} y2={HEIGHT - 3} className="trace-selection" />
+              )}
+            </svg>
 
-          <div className="trace-ticks" aria-hidden="true">
-            <span>00:00</span>
-            <span>{formatMs(trace.durationMs / 2)}</span>
-            <span>{formatMs(trace.durationMs)}</span>
+            <div className="trace-ticks" aria-hidden="true">
+              <span>00:00</span>
+              <span>{formatMs(trace.durationMs / 2)}</span>
+              <span>{formatMs(trace.durationMs)}</span>
+            </div>
           </div>
-          <div className="trace-inspector" aria-live="polite">
-            {selected ? describeEvent(selected) : "←/→ INSPECT EVENTS · A/B MARKERS: ▶ PLAY · Ⅱ PAUSE · ◆ SEEK"}
+          <div className="trace-inspection">
+            <div id="trace-inspector" className="trace-inspector" aria-live="polite">
+              {selected ? describeEvent(selected) : sortedEvents.length > 0
+                ? "Tap the trace or use ←/→ to inspect. A/B markers: ▶ play · Ⅱ pause · ◆ seek"
+                : "No control moves were recorded. Record a new transition and move a mixer control."}
+            </div>
+            <div className="trace-event-controls" aria-label="Inspect recorded events">
+              <button
+                className="btn trace-event-button"
+                type="button"
+                aria-label="Previous recorded event"
+                disabled={sortedEvents.length === 0 || selectedIndex === 0}
+                onClick={() => setSelectedIndex((current) => Math.max(0, (current ?? 1) - 1))}
+              >
+                ← Previous
+              </button>
+              <span className="trace-event-count">
+                {selectedIndex === null ? "—" : selectedIndex + 1} / {sortedEvents.length}
+              </span>
+              <button
+                className="btn trace-event-button"
+                type="button"
+                aria-label="Next recorded event"
+                disabled={sortedEvents.length === 0 || selectedIndex === sortedEvents.length - 1}
+                onClick={() => setSelectedIndex((current) => Math.min(sortedEvents.length - 1, (current ?? -1) + 1))}
+              >
+                Next →
+              </button>
+            </div>
           </div>
         </>
       )}

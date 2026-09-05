@@ -4,11 +4,11 @@
 
 Ghost Deck is the smallest credible replayable-performance instrument: capture a short local two-deck transition as a portable control trace, replay it honestly, inspect it, and eventually practice against it.
 
-The trace—not a feature-complete DJ suite—is the product. The project remains browser-local, dependency-light, and visually rooted in its late-1990s/early-2000s console identity.
+The trace is the product. The project remains browser-local, dependency-light, and visually rooted in its late-1990s/early-2000s console identity and the Bad Company radio and club archive.
 
 ## v0.2 — Measured Portable Replay
 
-Status: implemented in the current working tree; pending final real-audio/browser acceptance and repository publication.
+Status: the replay foundation is implemented and retained in v0.2.1. See the next section for the current upgrade and acceptance status.
 
 | Outcome | Acceptance criterion | Status |
 |---|---|---|
@@ -25,7 +25,26 @@ Status: implemented in the current working tree; pending final real-audio/browse
 | Local waveform context | Compact decoded peak envelope with accessible seeking | Done |
 | Release gate | Lint, unit tests, production build, CI, versioning, docs, license | Done |
 | Manual acceptance | Two real tracks, non-default live start, idle tail, replay, export/import, v1 import, narrow layout | Pending human/browser pass |
-| GitHub Pages | Workflow exists and repository Pages source is set to GitHub Actions | Pending repository setting/push |
+| GitHub Pages | Static deployment with checks and the `/ghost-deck/` base path | Existing deployment target; main pushes run checks and deploy |
+
+## v0.2.1 — Playable Demo and Console Polish
+
+Status: implemented and verified locally with lint, 44 unit tests, a production build, and browser acceptance at desktop and 390px widths. GitHub Actions gates publication. Dedicated listening/codec acceptance and automated browser end-to-end coverage remain future work.
+
+| Outcome | Acceptance criterion | Status |
+|---|---|---|
+| Immediate first session | Browser generates two original 120 BPM, eight-bar, 16-second WAV parts with no audio download or autoplay | Implemented; synthesis unit tests pass |
+| Reference transition | A 12-second trace moves A to B with filter/delay gestures, known local identities, and measured replay results | Implemented; trace and final-state unit tests pass |
+| Session replacement | An inline prompt explains replacement and lets the user keep the current session | Verified in the browser |
+| Console identity | Ghost mark, deck color hierarchy, guided session flow, and responsive layout connect to Bad Company's radio/club archive | Verified in the browser |
+| Live recording feedback | REC→STOP clock and event count update during recording without cloning the entire trace each frame | Verified in the browser |
+| Event inspection | Pointer selection, a selection cursor, accessible Previous/Next controls, and keyboard navigation inspect events without moving audio controls | Verified in the browser |
+| Keyboard isolation | Focused controls and timeline/waveform navigation retain their key events | Verified in the browser |
+| Operation guards | Record/replay startup, STOP cancellation, demo loading, and async import cannot overlap or replace an active operation | Reviewed; replay locking, immediate Stop, and legacy import verified in browser |
+
+Browser acceptance confirmed the demo completed all 116 events with matching track identity and final state; immediate Stop interrupted cleanly; a new recording captured two moves with a live clock; pointer/keyboard inspection preserved mixer position; export showed success; local WAV replacement blocked mismatched replay; and v1 import migrated with UNKNOWN identities. The 390px layout had no page-level horizontal overflow.
+
+Trace format v2, local file identities, the single ControlBus, and measured replay remain the foundation. Demo synthesis adds no dependencies or remote audio assets. Keep the separate live-versus-reference practice flow for v0.3.
 
 ## v0.3 — Practice Ghost
 
@@ -67,6 +86,7 @@ Acceptance gate: a user can perform against a ghost without altering the referen
 - SHA-256 identifies file bytes, not musically equivalent transcodes.
 - The fixed delay is not tempo-synced.
 - State is in memory until a trace is exported.
+- The 100,000-event limit can produce exported JSON larger than the 5 MB import limit. Such traces cannot currently round-trip; align capture/export and import bounds in a future fix. This existing issue is deferred from v0.2.1.
 
 ## Decision log
 
@@ -75,3 +95,5 @@ Acceptance gate: a user can perform against a ghost without altering the referen
 - **2026-08 — Locked replay:** keep v0.2 reproducible; defer live-vs-ghost interaction to a separate practice mode.
 - **2026-08 — Native FX:** add only lightweight delay and deterministic convolution reverb through the trace/control architecture.
 - **2026-08 — No AudioWorklet yet:** collect evidence from replay reports before accepting extra scheduler complexity.
+- **2026-09 — A playable first transition:** generate quiet, original demo parts locally and run their reference trace through the existing identity and measured replay paths.
+- **2026-09 — Console polish before practice mode:** clarify the session flow, recording feedback, inspection, and operation boundaries while preserving v0.3 Practice Ghost as separate work.

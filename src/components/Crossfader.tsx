@@ -29,7 +29,7 @@ export function Crossfader({ engine, bus, ghostValue, disabled }: Props) {
     <section className={`crossfader-section ${disabled ? "crossfader-section--locked" : ""}`} aria-labelledby="crossfader-title">
       <div className="crossfader-labels">
         <span>A</span>
-        <h2 className="crossfader-title" id="crossfader-title">CROSSFADER</h2>
+        <h3 className="crossfader-title" id="crossfader-title">CROSSFADER</h3>
         <span>B</span>
       </div>
       <div className="crossfader-track-wrap">
@@ -64,7 +64,7 @@ export function Crossfader({ engine, bus, ghostValue, disabled }: Props) {
             ? `B +${Math.round((value - 0.5) * 200)}%`
             : "CENTER"}
       </div>
-      {disabled && <div className="control-lock-label">GHOST HAS CONTROL</div>}
+      {disabled && <div className="control-lock-label">{ghostValue !== undefined ? "GHOST HAS CONTROL" : "PREPARING AUDIO"}</div>}
     </section>
   );
 }

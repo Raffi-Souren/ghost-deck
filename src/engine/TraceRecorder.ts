@@ -336,6 +336,10 @@ export class TraceRecorder {
     return this.recording;
   }
 
+  get eventCount() {
+    return this.session?.events.length ?? 0;
+  }
+
   start(initialState: EngineSnapshot, tracks: LoadedTracks) {
     this.session = {
       version: TRACE_VERSION,

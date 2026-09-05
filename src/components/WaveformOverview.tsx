@@ -75,7 +75,7 @@ export function WaveformOverview({
 
   return (
     <div className="waveform-overview">
-      <div className="waveform-label">TRACK ENVELOPE // CLICK OR USE ARROWS TO SEEK</div>
+      <div className="waveform-label"><span>Waveform</span><span>{duration > 0 ? "Click or use arrows to cue" : "Waiting for your track"}</span></div>
       <canvas
         ref={canvasRef}
         className="waveform-canvas"

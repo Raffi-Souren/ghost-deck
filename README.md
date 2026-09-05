@@ -8,7 +8,20 @@ The transition trace is the product. Ghost Deck deliberately does not attempt to
 
 Audio files, fingerprints, and traces stay in your browser. There is no backend, account, upload path, analytics, or telemetry.
 
-## What v0.2 adds
+## What v0.2.1 adds
+
+This release makes the first transition playable immediately and refines the console around Bad Company's radio and club archive identity: a custom ghost mark, clearer deck colors, a guided session flow, and a responsive layout.
+
+- **Load a demo session** creates two original instrumental parts in the browser: **Night Drive — drums & bass** and **Afterglow — hats & chords**. Both are deterministic 120 BPM, eight-bar, 16-second PCM WAVs with locally computed identities.
+- A ready-to-replay 12-second reference trace crosses from Deck A to Deck B with filter and delay gestures. It uses the same trace v2, track checks, scheduler, and measured replay report as your own recordings.
+- Loading the demo does not autoplay or download audio. When tracks or a trace are already present, an inline replacement prompt offers **Replace with demo** or **Keep my session**.
+- Recording shows a live REC→STOP clock and control-event count.
+- Click or tap the Trace Path to inspect the nearest event, use the accessible Previous/Next buttons, or navigate with the keyboard. Selection has its own visible cursor.
+- Timeline and waveform navigation are isolated from global deck shortcuts. Record, replay, demo loading, and trace import have operation guards; delayed async work cannot restart a cancelled recording or replay.
+
+The waveform generation is deterministic; browser replay timing remains measured rather than assumed exact. Practice against a separate live performance remains the v0.3 direction.
+
+## Replay foundation (v0.2)
 
 - Trace format v2 stores the full initial and final engine snapshots, REC→STOP duration, app version, locally computed track identity, and every user control event.
 - Pressing REC while a deck is already playing now preserves its cue position and playback state.
@@ -44,14 +57,21 @@ npm run check       # lint + tests + production build
 npm run preview
 ```
 
+## Try the demo
+
+1. Choose **Load a demo session**. If a session is already present, export any trace you want to retain, then confirm replacement.
+2. Press **◈ REPLAY GHOST** to start audio and watch the 12-second transition. Loading alone leaves both decks stopped.
+3. Inspect the Trace Path and the measured timing, track-match, and final-state results. **■ STOP** interrupts playback whenever needed.
+4. Cue both tracks with their waveforms, position the crossfader, then press **● REC** and play the loaded parts to capture your own transition. The demo audio remains local and is not included in exported JSON.
+
 ## Record and replay a transition
 
 1. Load local audio into Deck A and/or Deck B. Decoding support depends on the browser and operating system codec stack.
 2. Cue the tracks. You may seek, play, set gain/filter, add delay or reverb, and position the crossfader before recording.
 3. Press **● REC**. Ghost Deck snapshots both decks, the mixer, FX, and local track identities at that moment.
-4. Perform the transition. UI and keyboard movements flow through the same recorder path.
+4. Perform the transition. UI and keyboard movements flow through the same recorder path; the duration and event count update while recording.
 5. Press **■ STOP**. The final state and the complete REC→STOP duration are retained, including silence after the last gesture.
-6. Inspect **TRACE PATH**. Focus it and use Left/Right, Home, and End to inspect recorded events.
+6. Inspect **TRACE PATH**. Click or tap to select the nearest event, use Previous/Next, or focus the timeline and use Left/Right, Home, and End. Escape clears selection. Inspection does not seek audio or move the crossfader.
 7. Press **◈ REPLAY GHOST**. Matching tracks are checked, the initial state is restored, and user input is locked until completion or STOP.
 8. Review the measured replay result instead of assuming timing was exact.
 9. Export the trace as JSON or import it later. Audio is never embedded in the trace, so corresponding local tracks still need to be loaded.
@@ -69,7 +89,7 @@ npm run preview
 | `←` / `→` | Crossfader left / right |
 | `Space` | Toggle Deck A |
 
-Shortcuts do not hijack focused buttons, inputs, text fields, or editable content.
+Shortcuts do not hijack focused buttons, links, keyboard-help disclosures, sliders, inputs, text fields, or editable content. Arrow keys used by the timeline or waveform stay with that control.
 
 ## Portable trace format
 
@@ -143,11 +163,14 @@ src/
 │   ├── ReplayScheduler.ts     absolute-clock measured replay
 │   ├── ReplayMetrics.ts       drift and final-state comparison
 │   ├── TrackIdentity.ts       local SHA-256 and match classification
+│   ├── DemoSession.ts         original PCM synthesis and reference transition
 │   ├── AudioMath.ts           equal-power and logarithmic mappings
 │   ├── KeyboardController.ts  keyboard → ControlBus
 │   └── Waveform.ts            compact local peak extraction
 ├── components/
 │   ├── Deck.tsx
+│   ├── GhostMark.tsx
+│   ├── SessionGuide.tsx
 │   ├── Crossfader.tsx
 │   ├── TraceTimeline.tsx
 │   ├── ReplayReportPanel.tsx
@@ -173,6 +196,9 @@ src/
 - The delay is fixed at 375 ms and is not beat-synced. Automatic BPM detection and beatmatching are deliberate non-goals.
 - Reloading the page clears decoded tracks and the in-memory trace unless it was exported.
 - The current practice mode is replay-only: user controls are locked rather than mixed into the ghost path.
+- The existing 100,000-event recording limit and 5 MB import limit are not aligned: an exported trace at the event limit can exceed the import limit and fail to reimport. This is tracked for a future fix; keep recordings short.
+
+Automated checks cover engine behavior, WAV generation, and trace integrity. Browser interaction acceptance is performed manually; audible listening quality and automated browser end-to-end coverage are not established by the unit suite.
 
 See [ROADMAP.md](ROADMAP.md) for what was accepted from the v0.1 audit, what remains, and the v0.3 Practice Ghost direction.
 

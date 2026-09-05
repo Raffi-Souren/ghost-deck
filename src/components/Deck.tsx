@@ -1,4 +1,4 @@
-import { useRef, useState, useCallback } from "react";
+import { useRef, useState, useCallback, useMemo, useEffect } from "react";
 import type { AudioEngine } from "../engine/AudioEngine";
 import type { ControlBus, DeckId } from "../engine/ControlBus";
 import { filterHzToUnit, filterUnitToHz } from "../engine/AudioMath";
@@ -11,6 +11,7 @@ interface Props {
   id: DeckId;
   engine: AudioEngine;
   bus: ControlBus;
+  track: TrackIdentity | null;
   ghostGain?: number;
   ghostFilter?: number;
   ghostDelay?: number;
@@ -31,6 +32,7 @@ export function Deck({
   id,
   engine,
   bus,
+  track,
   ghostGain,
   ghostFilter,
   ghostDelay,
@@ -43,11 +45,13 @@ export function Deck({
   const state = useDeckState(engine, id);
   const inputRef = useRef<HTMLInputElement>(null);
   const loadingRef = useRef(false);
-  const [fileName, setFileName] = useState("");
   const [error, setError] = useState("");
   const [isDragOver, setIsDragOver] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
-  const [waveformPeaks, setWaveformPeaks] = useState<number[]>([]);
+  const fileName = track?.name ?? "";
+  const waveformPeaks = useMemo(() => track ? engine.getWaveformPeaks(id) : [], [engine, id, track]);
+
+  useEffect(() => { setError(""); }, [track]);
 
   const loadFile = useCallback(async (file: File) => {
     if (loadDisabled || loadingRef.current) return;
@@ -66,7 +70,6 @@ export function Deck({
       const fingerprint = sha256Hex(fingerprintBuffer).catch(() => undefined);
       await engine.loadBuffer(id, arrayBuffer);
       const durationSec = engine.getDeckState(id).duration;
-      setWaveformPeaks(engine.getWaveformPeaks(id));
       const sha256 = await fingerprint;
       const identity: TrackIdentity = {
         name: file.name,
@@ -75,7 +78,6 @@ export function Deck({
         durationSec,
         ...(sha256 ? { sha256 } : {}),
       };
-      setFileName(file.name);
       onTrackLoaded(id, identity);
     } catch (loadError) {
       setError("DECODE FAILED IN THIS BROWSER");
@@ -101,8 +103,11 @@ export function Deck({
   };
 
   const handlePlayPause = () => {
-    void engine.resume();
-    bus.dispatch(id, state.isPlaying ? "pause" : "play", state.isPlaying ? 0 : 1);
+    // Start the source on the current control path. Do not queue a gesture
+    // behind resume(), where it could outlive a later replay or Stop action.
+    void engine.resume().catch(() => setError("Audio could not start. Try Play again."));
+    const playing = engine.getDeckState(id).isPlaying;
+    bus.dispatch(id, playing ? "pause" : "play", playing ? 0 : 1);
   };
 
   const hasTrack = engine.hasBuffer(id);
@@ -128,9 +133,9 @@ export function Deck({
       onDrop={handleDrop}
     >
       <div className="deck-header">
-        <h2 className="deck-label" id={deckLabelId}>DECK {id}</h2>
-        {hasTrack && <span className="deck-loaded">● LOADED</span>}
-        {controlsDisabled && <span className="deck-lock">GHOST LOCK</span>}
+        <h3 className="deck-label" id={deckLabelId}><span>{id}</span> Deck {id}</h3>
+        <span className="deck-loaded">{isLoading ? "Loading…" : state.isPlaying ? "● Playing" : hasTrack ? "Cued up" : "No track"}</span>
+        {controlsDisabled && <span className="deck-lock">{ghostGain !== undefined ? "GHOST LOCK" : "PREPARING"}</span>}
       </div>
 
       <div className="deck-loader">
@@ -140,7 +145,7 @@ export function Deck({
           onClick={() => inputRef.current?.click()}
           disabled={loadDisabled || isLoading}
         >
-          {isLoading ? "HASHING + DECODING…" : "LOAD TRACK"}
+          {isLoading ? "Loading…" : hasTrack ? "+ Replace" : "+ Load track"}
         </button>
         <input
           ref={inputRef}
@@ -151,20 +156,20 @@ export function Deck({
           disabled={loadDisabled}
         />
         <span className="deck-filename" title={fileName || undefined}>
-          {error ? <span className="error" role="alert">{error}</span> : (fileName || "DROP LOCAL AUDIO HERE")}
+          {error ? <span className="error" role="alert">{error}</span> : (fileName || "Drop audio here, or choose a file")}
         </span>
       </div>
 
-      <div className="visualiser-label">LIVE SPECTRUM // PRE-FADER</div>
+      <div className="visualiser-label"><span>Live spectrum</span><span>Pre-fader</span></div>
       <div className="visualiser-wrap" aria-hidden="true">
-        <Visualiser analyser={engine.getAnalyser(id)} color={id === "A" ? "#00ff99" : "#ff7a29"} />
+        <Visualiser analyser={engine.getAnalyser(id)} color={id === "A" ? "#5ce0b0" : "#ffad74"} />
       </div>
 
       <WaveformOverview
         peaks={waveformPeaks}
         progress={progress}
         duration={state.duration}
-        color={id === "A" ? "#00ff99" : "#ff7a29"}
+        color={id === "A" ? "#5ce0b0" : "#ffad74"}
         disabled={controlsDisabled}
         deckLabel={`Deck ${id}`}
         onSeek={(seconds) => bus.dispatch(id, "seek", seconds)}
@@ -194,7 +199,7 @@ export function Deck({
         onClick={handlePlayPause}
         disabled={!hasTrack || controlsDisabled}
       >
-        {state.isPlaying ? "⏸ PAUSE" : "▶ PLAY"}
+        {state.isPlaying ? "Ⅱ Pause" : "▶ Play"}
       </button>
 
       <div className="knob-row">
